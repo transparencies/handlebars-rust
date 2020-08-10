@@ -196,7 +196,14 @@ mod test {
 
     #[test]
     fn test_html_expression() {
-        let s = vec!["{{{html}}}", "{{{(html)}}}", "{{{(html)}}}", "{{&html}}"];
+        let s = vec![
+            "{{{html}}}",
+            "{{{(html)}}}",
+            "{{{(html)}}}",
+            "{{&html}}",
+            "{{{html 1}}}",
+            "{{{html p=true}}}",
+        ];
         for i in s.iter() {
             assert_rule!(Rule::html_expression, i);
         }
