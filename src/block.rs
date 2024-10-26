@@ -57,9 +57,9 @@ impl<'reg> BlockParams<'reg> {
 /// A data structure holds contextual data for current block scope.
 #[derive(Debug, Clone, Default)]
 pub struct BlockContext<'rc> {
-    /// the base_path of current block scope
+    /// the `base_path` of current block scope
     base_path: Vec<String>,
-    /// the base_value of current block scope, when the block is using a
+    /// the `base_value` of current block scope, when the block is using a
     /// constant or derived value as block base
     base_value: Option<Json>,
     /// current block context variables
@@ -124,8 +124,13 @@ impl<'rc> BlockContext<'rc> {
         self.block_params.get(block_param_name)
     }
 
-    /// Set a block parameter into this block.
+    /// Reassign the block parameters for this block.
     pub fn set_block_params(&mut self, block_params: BlockParams<'rc>) {
         self.block_params = block_params;
+    }
+
+    /// Set a block parameter into this block.
+    pub fn set_block_param(&mut self, key: &'rc str, value: BlockParamHolder) {
+        self.block_params.data.insert(key, value);
     }
 }

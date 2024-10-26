@@ -14,7 +14,11 @@ use crate::json::value::{JsonRender, PathAndJson, ScopedJson};
 use crate::output::{Output, StringOutput};
 use crate::registry::Registry;
 use crate::support;
-use crate::template::TemplateElement::*;
+use crate::support::str::newline_matcher;
+use crate::template::TemplateElement::{
+    DecoratorBlock, DecoratorExpression, Expression, HelperBlock, HtmlExpression, PartialBlock,
+    PartialExpression, RawString,
+};
 use crate::template::{
     BlockParam, DecoratorTemplate, HelperTemplate, Parameter, Template, TemplateElement,
     TemplateMapping,
@@ -29,18 +33,17 @@ const BLOCK_HELPER_MISSING: &str = "blockHelperMissing";
 /// This context stores information of a render and a writer where generated
 /// content is written to.
 ///
-#[derive(Clone, Debug)]
-pub struct RenderContext<'reg, 'rc> {
-    inner: Rc<RenderContextInner<'reg, 'rc>>,
+#[derive(Clone)]
+pub struct RenderContext<'reg: 'rc, 'rc> {
+    dev_mode_templates: Option<&'rc BTreeMap<String, Cow<'rc, Template>>>,
+
     blocks: VecDeque<BlockContext<'rc>>,
+
     // copy-on-write context
     modified_context: Option<Rc<Context>>,
-}
 
-#[derive(Clone)]
-pub struct RenderContextInner<'reg: 'rc, 'rc> {
     partials: BTreeMap<String, &'rc Template>,
-    partial_block_stack: VecDeque<&'reg Template>,
+    partial_block_stack: VecDeque<&'rc Template>,
     partial_block_depth: isize,
     local_helpers: BTreeMap<String, Rc<dyn HelperDef + Send + Sync + 'rc>>,
     /// current template name
@@ -48,13 +51,28 @@ pub struct RenderContextInner<'reg: 'rc, 'rc> {
     /// root template name
     root_template: Option<&'reg String>,
     disable_escape: bool,
-    indent_string: Option<&'reg String>,
+
+    // Indicates whether the previous text that we rendered ended on a newline.
+    // This is necessary to make indenting decisions after the end of partials.
+    trailing_newline: bool,
+
+    // This should be set to true whenever any output is written.
+    // We need this to detect empty partials/helpers for indenting decisions.
+    content_produced: bool,
+
+    // The next text that we render should indent itself.
+    indent_before_write: bool,
+    indent_string: Option<Cow<'rc, str>>,
 }
 
 impl<'reg: 'rc, 'rc> RenderContext<'reg, 'rc> {
     /// Create a render context
     pub fn new(root_template: Option<&'reg String>) -> RenderContext<'reg, 'rc> {
-        let inner = Rc::new(RenderContextInner {
+        let mut blocks = VecDeque::with_capacity(5);
+        blocks.push_front(BlockContext::new());
+
+        let modified_context = None;
+        RenderContext {
             partials: BTreeMap::new(),
             partial_block_stack: VecDeque::new(),
             partial_block_depth: 0,
@@ -62,32 +80,13 @@ impl<'reg: 'rc, 'rc> RenderContext<'reg, 'rc> {
             current_template: None,
             root_template,
             disable_escape: false,
+            trailing_newline: false,
+            content_produced: false,
+            indent_before_write: false,
             indent_string: None,
-        });
-
-        let mut blocks = VecDeque::with_capacity(5);
-        blocks.push_front(BlockContext::new());
-
-        let modified_context = None;
-        RenderContext {
-            inner,
             blocks,
             modified_context,
-        }
-    }
-
-    pub(crate) fn new_for_block(&self) -> RenderContext<'reg, 'rc> {
-        let inner = self.inner.clone();
-
-        let mut blocks = VecDeque::with_capacity(2);
-        blocks.push_front(BlockContext::new());
-
-        let modified_context = self.modified_context.clone();
-
-        RenderContext {
-            inner,
-            blocks,
-            modified_context,
+            dev_mode_templates: None,
         }
     }
 
@@ -118,14 +117,6 @@ impl<'reg: 'rc, 'rc> RenderContext<'reg, 'rc> {
         self.blocks.front_mut()
     }
 
-    fn inner(&self) -> &RenderContextInner<'reg, 'rc> {
-        self.inner.borrow()
-    }
-
-    fn inner_mut(&mut self) -> &mut RenderContextInner<'reg, 'rc> {
-        Rc::make_mut(&mut self.inner)
-    }
-
     /// Get the modified context data if any
     pub fn context(&self) -> Option<Rc<Context>> {
         self.modified_context.clone()
@@ -135,7 +126,7 @@ impl<'reg: 'rc, 'rc> RenderContext<'reg, 'rc> {
     /// This is typically called in decorators where user can modify
     /// the data they were rendering.
     pub fn set_context(&mut self, ctx: Context) {
-        self.modified_context = Some(Rc::new(ctx))
+        self.modified_context = Some(Rc::new(ctx));
     }
 
     /// Evaluate a Json path in current scope.
@@ -160,60 +151,70 @@ impl<'reg: 'rc, 'rc> RenderContext<'reg, 'rc> {
         match path {
             Path::Local((level, name, _)) => Ok(self
                 .get_local_var(*level, name)
-                .map(|v| ScopedJson::Derived(v.clone()))
-                .unwrap_or_else(|| ScopedJson::Missing)),
+                .map_or_else(|| ScopedJson::Missing, |v| ScopedJson::Derived(v.clone()))),
             Path::Relative((segs, _)) => context.navigate(segs, &self.blocks),
         }
     }
 
     /// Get registered partial in this render context
-    pub fn get_partial(&self, name: &str) -> Option<&Template> {
+    pub fn get_partial(&self, name: &str) -> Option<&'rc Template> {
         if name == partial::PARTIAL_BLOCK {
             return self
-                .inner()
                 .partial_block_stack
-                .get(self.inner().partial_block_depth as usize)
+                .get(self.partial_block_depth as usize)
                 .copied();
         }
-        self.inner().partials.get(name).copied()
+        self.partials.get(name).copied()
     }
 
     /// Register a partial for this context
     pub fn set_partial(&mut self, name: String, partial: &'rc Template) {
-        self.inner_mut().partials.insert(name, partial);
+        self.partials.insert(name, partial);
     }
 
-    pub(crate) fn push_partial_block(&mut self, partial: &'reg Template) {
-        self.inner_mut().partial_block_stack.push_front(partial);
+    pub(crate) fn push_partial_block(&mut self, partial: &'rc Template) {
+        self.partial_block_stack.push_front(partial);
     }
 
     pub(crate) fn pop_partial_block(&mut self) {
-        self.inner_mut().partial_block_stack.pop_front();
+        self.partial_block_stack.pop_front();
     }
 
     pub(crate) fn inc_partial_block_depth(&mut self) {
-        self.inner_mut().partial_block_depth += 1;
+        self.partial_block_depth += 1;
     }
 
     pub(crate) fn dec_partial_block_depth(&mut self) {
-        let depth = &mut self.inner_mut().partial_block_depth;
+        let depth = &mut self.partial_block_depth;
         if *depth > 0 {
             *depth -= 1;
         }
     }
 
-    pub(crate) fn set_indent_string(&mut self, indent: Option<&'reg String>) {
-        self.inner_mut().indent_string = indent;
+    pub(crate) fn set_indent_string(&mut self, indent: Option<Cow<'rc, str>>) {
+        self.indent_string = indent;
     }
 
     #[inline]
-    pub(crate) fn get_indent_string(&self) -> Option<&'reg String> {
-        self.inner.indent_string
+    pub(crate) fn get_indent_string(&self) -> Option<&Cow<'rc, str>> {
+        self.indent_string.as_ref()
+    }
+
+    pub(crate) fn get_dev_mode_template(&self, name: &str) -> Option<&'rc Template> {
+        self.dev_mode_templates
+            .and_then(|dmt| dmt.get(name).map(|t| &**t))
+    }
+
+    pub(crate) fn set_dev_mode_templates(
+        &mut self,
+        t: Option<&'rc BTreeMap<String, Cow<'rc, Template>>>,
+    ) {
+        self.dev_mode_templates = t;
     }
 
     /// Remove a registered partial
     pub fn remove_partial(&mut self, name: &str) {
-        self.inner_mut().partials.remove(name);
+        self.partials.remove(name);
     }
 
     fn get_local_var(&self, level: usize, name: &str) -> Option<&Json> {
@@ -224,10 +225,7 @@ impl<'reg: 'rc, 'rc> RenderContext<'reg, 'rc> {
 
     /// Test if given template name is current template.
     pub fn is_current_template(&self, p: &str) -> bool {
-        self.inner()
-            .current_template
-            .map(|s| s == p)
-            .unwrap_or(false)
+        self.current_template.is_some_and(|s| s == p)
     }
 
     /// Register a helper in this render context.
@@ -238,59 +236,90 @@ impl<'reg: 'rc, 'rc> RenderContext<'reg, 'rc> {
         name: &str,
         def: Box<dyn HelperDef + Send + Sync + 'rc>,
     ) {
-        self.inner_mut()
-            .local_helpers
-            .insert(name.to_string(), def.into());
+        self.local_helpers.insert(name.to_string(), def.into());
     }
 
     /// Remove a helper from render context
     pub fn unregister_local_helper(&mut self, name: &str) {
-        self.inner_mut().local_helpers.remove(name);
+        self.local_helpers.remove(name);
     }
 
     /// Attempt to get a helper from current render context.
     pub fn get_local_helper(&self, name: &str) -> Option<Rc<dyn HelperDef + Send + Sync + 'rc>> {
-        self.inner().local_helpers.get(name).cloned()
+        self.local_helpers.get(name).cloned()
     }
 
     #[inline]
     fn has_local_helper(&self, name: &str) -> bool {
-        self.inner.local_helpers.contains_key(name)
+        self.local_helpers.contains_key(name)
     }
 
     /// Returns the current template name.
     /// Note that the name can be vary from root template when you are rendering
     /// from partials.
     pub fn get_current_template_name(&self) -> Option<&'rc String> {
-        self.inner().current_template
+        self.current_template
     }
 
     /// Set the current template name.
     pub fn set_current_template_name(&mut self, name: Option<&'rc String>) {
-        self.inner_mut().current_template = name;
+        self.current_template = name;
     }
 
     /// Get root template name if any.
     /// This is the template name that you call `render` from `Handlebars`.
     pub fn get_root_template_name(&self) -> Option<&'reg String> {
-        self.inner().root_template
+        self.root_template
     }
 
     /// Get the escape toggle
     pub fn is_disable_escape(&self) -> bool {
-        self.inner().disable_escape
+        self.disable_escape
     }
 
     /// Set the escape toggle.
-    /// When toggle is on, escape_fn will be called when rendering.
+    /// When toggle is on, `escape_fn` will be called when rendering.
     pub fn set_disable_escape(&mut self, disable: bool) {
-        self.inner_mut().disable_escape = disable
+        self.disable_escape = disable;
+    }
+
+    #[inline]
+    pub fn set_trailing_newline(&mut self, trailing_newline: bool) {
+        self.trailing_newline = trailing_newline;
+    }
+
+    #[inline]
+    pub fn get_trailine_newline(&self) -> bool {
+        self.trailing_newline
+    }
+
+    #[inline]
+    pub fn set_content_produced(&mut self, content_produced: bool) {
+        self.content_produced = content_produced;
+    }
+
+    #[inline]
+    pub fn get_content_produced(&self) -> bool {
+        self.content_produced
+    }
+
+    #[inline]
+    pub fn set_indent_before_write(&mut self, indent_before_write: bool) {
+        self.indent_before_write = indent_before_write;
+    }
+
+    #[inline]
+    pub fn get_indent_before_write(&self) -> bool {
+        self.indent_before_write
     }
 }
 
-impl<'reg, 'rc> fmt::Debug for RenderContextInner<'reg, 'rc> {
+impl fmt::Debug for RenderContext<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         f.debug_struct("RenderContextInner")
+            .field("dev_mode_templates", &self.dev_mode_templates)
+            .field("blocks", &self.blocks)
+            .field("modified_context", &self.modified_context)
             .field("partials", &self.partials)
             .field("partial_block_stack", &self.partial_block_stack)
             .field("partial_block_depth", &self.partial_block_depth)
@@ -454,7 +483,7 @@ pub struct Decorator<'rc> {
     params: Vec<PathAndJson<'rc>>,
     hash: BTreeMap<&'rc str, PathAndJson<'rc>>,
     template: Option<&'rc Template>,
-    indent: Option<&'rc String>,
+    indent: Option<Cow<'rc, str>>,
 }
 
 impl<'reg: 'rc, 'rc> Decorator<'rc> {
@@ -478,12 +507,23 @@ impl<'reg: 'rc, 'rc> Decorator<'rc> {
             hm.insert(k.as_ref(), r);
         }
 
+        let indent = match (render_context.get_indent_string(), dt.indent.as_ref()) {
+            (None, None) => None,
+            (Some(s), None) => Some(s.clone()),
+            (None, Some(s)) => Some(Cow::Borrowed(&**s)),
+            (Some(s1), Some(s2)) => {
+                let mut res = s1.to_string();
+                res.push_str(s2);
+                Some(Cow::from(res))
+            }
+        };
+
         Ok(Decorator {
             name,
             params: pv,
             hash: hm,
             template: dt.template.as_ref(),
-            indent: dt.indent.as_ref(),
+            indent,
         })
     }
 
@@ -517,14 +557,14 @@ impl<'reg: 'rc, 'rc> Decorator<'rc> {
         self.template
     }
 
-    pub fn indent(&self) -> Option<&'rc String> {
-        self.indent
+    pub fn indent(&self) -> Option<&Cow<'rc, str>> {
+        self.indent.as_ref()
     }
 }
 
 /// Render trait
 pub trait Renderable {
-    /// render into RenderContext's `writer`
+    /// render into `RenderContext`'s `writer`
     fn render<'reg: 'rc, 'rc>(
         &'rc self,
         registry: &'reg Registry<'reg>,
@@ -693,6 +733,7 @@ impl Renderable for Template {
                 e
             })?;
         }
+
         Ok(())
     }
 }
@@ -746,8 +787,26 @@ fn render_helper<'reg: 'rc, 'rc>(
         h.params(),
         h.hash()
     );
+    let mut call_indent_aware = |helper_def: &dyn HelperDef, rc: &mut RenderContext<'reg, 'rc>| {
+        let indent_directive_before = rc.get_indent_before_write();
+        let content_produced_before = rc.get_content_produced();
+        rc.set_content_produced(false);
+        rc.set_indent_before_write(
+            indent_directive_before || (ht.indent_before_write && rc.get_trailine_newline()),
+        );
+
+        helper_def.call(&h, registry, ctx, rc, out)?;
+
+        if rc.get_content_produced() {
+            rc.set_indent_before_write(rc.get_trailine_newline());
+        } else {
+            rc.set_content_produced(content_produced_before);
+            rc.set_indent_before_write(indent_directive_before);
+        }
+        Ok(())
+    };
     if let Some(ref d) = rc.get_local_helper(h.name()) {
-        d.call(&h, registry, ctx, rc, out)
+        call_indent_aware(&**d, rc)
     } else {
         let mut helper = registry.get_or_load_helper(h.name())?;
 
@@ -761,7 +820,7 @@ fn render_helper<'reg: 'rc, 'rc>(
 
         helper
             .ok_or_else(|| RenderErrorReason::HelperNotFound(h.name().to_owned()).into())
-            .and_then(|d| d.call(&h, registry, ctx, rc, out))
+            .and_then(|d| call_indent_aware(&*d, rc))
     }
 }
 
@@ -774,16 +833,32 @@ pub(crate) fn do_escape(r: &Registry<'_>, rc: &RenderContext<'_, '_>, content: S
 }
 
 #[inline]
-fn indent_aware_write(
+pub fn indent_aware_write(
     v: &str,
-    rc: &RenderContext<'_, '_>,
+    rc: &mut RenderContext<'_, '_>,
     out: &mut dyn Output,
 ) -> Result<(), RenderError> {
+    if v.is_empty() {
+        return Ok(());
+    }
+    rc.set_content_produced(true);
+
+    if !v.starts_with(newline_matcher) && rc.get_indent_before_write() {
+        if let Some(indent) = rc.get_indent_string() {
+            out.write(indent)?;
+        }
+    }
+
     if let Some(indent) = rc.get_indent_string() {
-        out.write(support::str::with_indent(v, indent).as_ref())?;
+        support::str::write_indented(v, indent, out)?;
     } else {
         out.write(v.as_ref())?;
     }
+
+    let trailing_newline = v.ends_with(newline_matcher);
+    rc.set_trailing_newline(trailing_newline);
+    rc.set_indent_before_write(trailing_newline);
+
     Ok(())
 }
 
@@ -845,7 +920,23 @@ impl Renderable for TemplateElement {
             PartialExpression(ref dt) | PartialBlock(ref dt) => {
                 let di = Decorator::try_from_template(dt, registry, ctx, rc)?;
 
-                partial::expand_partial(&di, registry, ctx, rc, out)
+                let indent_directive_before = rc.get_indent_before_write();
+                let content_produced_before = rc.get_content_produced();
+
+                rc.set_indent_before_write(
+                    dt.indent_before_write && (rc.get_trailine_newline() || dt.indent.is_some()),
+                );
+                rc.set_content_produced(false);
+
+                partial::expand_partial(&di, registry, ctx, rc, out)?;
+
+                if rc.get_content_produced() {
+                    rc.set_indent_before_write(rc.get_trailine_newline());
+                } else {
+                    rc.set_content_produced(content_produced_before);
+                    rc.set_indent_before_write(indent_directive_before);
+                }
+                Ok(())
             }
             _ => Ok(()),
         }
@@ -962,7 +1053,7 @@ mod test {
                 &["hello"],
             )))),
             RawString("</h1>".to_string()),
-            Comment("".to_string()),
+            Comment(String::new()),
         ];
 
         let template = Template {
@@ -1017,7 +1108,6 @@ mod test {
                  out: &mut dyn Output|
                  -> Result<(), RenderError> {
                     out.write(&h.param(0).unwrap().value().render())
-                        .map(|_| ())
                         .map_err(RenderError::from)
                 },
             ),
@@ -1157,7 +1247,7 @@ mod test {
                  out: &mut dyn Output|
                  -> Result<(), RenderError> {
                     let name = h.name();
-                    write!(out, "{} not resolved", name)?;
+                    write!(out, "{name} not resolved")?;
                     Ok(())
                 },
             ),

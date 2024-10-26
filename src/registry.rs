@@ -1,5 +1,6 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::convert::AsRef;
 use std::fmt::{self, Debug, Formatter};
 use std::io::{Error as IoError, Write};
 use std::path::Path;
@@ -76,7 +77,7 @@ pub struct Registry<'reg> {
         HashMap<String, Arc<dyn Source<Item = String, Error = IoError> + Send + Sync + 'reg>>,
 }
 
-impl<'reg> Debug for Registry<'reg> {
+impl Debug for Registry<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
         f.debug_struct("Handlebars")
             .field("templates", &self.templates)
@@ -88,7 +89,7 @@ impl<'reg> Debug for Registry<'reg> {
     }
 }
 
-impl<'reg> Default for Registry<'reg> {
+impl Default for Registry<'_> {
     fn default() -> Self {
         Self::new()
     }
@@ -100,6 +101,7 @@ fn rhai_engine() -> Engine {
 }
 
 /// Options for importing template files from a directory.
+#[non_exhaustive]
 #[cfg(feature = "dir_source")]
 pub struct DirectorySourceOptions {
     /// The name extension for template files
@@ -271,6 +273,7 @@ impl<'reg> Registry<'reg> {
             tpl_str.as_ref(),
             TemplateOptions {
                 name: Some(name.to_owned()),
+                is_partial: false,
                 prevent_indent: self.prevent_indent,
             },
         )?;
@@ -592,6 +595,7 @@ impl<'reg> Registry<'reg> {
                         TemplateOptions {
                             name: Some(name.to_owned()),
                             prevent_indent: self.prevent_indent,
+                            is_partial: false,
                         },
                     )
                 })
@@ -649,7 +653,7 @@ impl<'reg> Registry<'reg> {
         &self,
         name: &str,
     ) -> Option<&(dyn DecoratorDef + Send + Sync + 'reg)> {
-        self.decorators.get(name).map(|v| v.as_ref())
+        self.decorators.get(name).map(AsRef::as_ref)
     }
 
     /// Return all templates registered
@@ -667,6 +671,52 @@ impl<'reg> Registry<'reg> {
         self.template_sources.clear();
     }
 
+    fn gather_dev_mode_templates(
+        &'reg self,
+        prebound: Option<(&str, Cow<'reg, Template>)>,
+    ) -> Result<BTreeMap<String, Cow<'reg, Template>>, RenderError> {
+        let prebound_name = prebound.as_ref().map(|(name, _)| *name);
+        let mut res = BTreeMap::new();
+        for name in self.template_sources.keys() {
+            if Some(&**name) == prebound_name {
+                continue;
+            }
+            res.insert(name.clone(), self.get_or_load_template(name)?);
+        }
+        if let Some((name, prebound)) = prebound {
+            res.insert(name.to_owned(), prebound);
+        }
+        Ok(res)
+    }
+
+    fn render_resolved_template_to_output(
+        &self,
+        name: Option<&str>,
+        template: Cow<'_, Template>,
+        ctx: &Context,
+        output: &mut impl Output,
+    ) -> Result<(), RenderError> {
+        if !self.dev_mode {
+            let mut render_context = RenderContext::new(template.name.as_ref());
+            return template.render(self, ctx, &mut render_context, output);
+        }
+
+        let dev_mode_templates;
+        let template = if let Some(name) = name {
+            dev_mode_templates = self.gather_dev_mode_templates(Some((name, template)))?;
+            &dev_mode_templates[name]
+        } else {
+            dev_mode_templates = self.gather_dev_mode_templates(None)?;
+            &template
+        };
+
+        let mut render_context = RenderContext::new(template.name.as_ref());
+
+        render_context.set_dev_mode_templates(Some(&dev_mode_templates));
+
+        template.render(self, ctx, &mut render_context, output)
+    }
+
     #[inline]
     fn render_to_output<O>(
         &self,
@@ -677,10 +727,12 @@ impl<'reg> Registry<'reg> {
     where
         O: Output,
     {
-        self.get_or_load_template(name).and_then(|t| {
-            let mut render_context = RenderContext::new(t.name.as_ref());
-            t.render(self, ctx, &mut render_context, output)
-        })
+        self.render_resolved_template_to_output(
+            Some(name),
+            self.get_or_load_template(name)?,
+            ctx,
+            output,
+        )
     }
 
     /// Render a registered template with some data into a string
@@ -758,10 +810,7 @@ impl<'reg> Registry<'reg> {
         .map_err(RenderError::from)?;
 
         let mut out = StringOutput::new();
-        {
-            let mut render_context = RenderContext::new(None);
-            tpl.render(self, ctx, &mut render_context, &mut out)?;
-        }
+        self.render_resolved_template_to_output(None, Cow::Owned(tpl), ctx, &mut out)?;
 
         out.into_string().map_err(RenderError::from)
     }
@@ -785,9 +834,9 @@ impl<'reg> Registry<'reg> {
             },
         )
         .map_err(RenderError::from)?;
-        let mut render_context = RenderContext::new(None);
         let mut out = WriteOutput::new(writer);
-        tpl.render(self, ctx, &mut render_context, &mut out)
+
+        self.render_resolved_template_to_output(None, Cow::Owned(tpl), ctx, &mut out)
     }
 
     /// Render a template string using current registry without registering it
@@ -903,29 +952,29 @@ mod test {
             assert_eq!(r.templates.len(), 0);
 
             let file1_path = dir.path().join("t1.hbs");
-            let mut file1: File = File::create(&file1_path).unwrap();
+            let mut file1: File = File::create(file1_path).unwrap();
             writeln!(file1, "<h1>Hello {{world}}!</h1>").unwrap();
 
             let file2_path = dir.path().join("t2.hbs");
-            let mut file2: File = File::create(&file2_path).unwrap();
+            let mut file2: File = File::create(file2_path).unwrap();
             writeln!(file2, "<h1>Hola {{world}}!</h1>").unwrap();
 
             let file3_path = dir.path().join("t3.hbs");
-            let mut file3: File = File::create(&file3_path).unwrap();
+            let mut file3: File = File::create(file3_path).unwrap();
             writeln!(file3, "<h1>Hallo {{world}}!</h1>").unwrap();
 
             let file4_path = dir.path().join(".t4.hbs");
-            let mut file4: File = File::create(&file4_path).unwrap();
+            let mut file4: File = File::create(file4_path).unwrap();
             writeln!(file4, "<h1>Hallo {{world}}!</h1>").unwrap();
 
             r.register_templates_directory(dir.path(), DirectorySourceOptions::default())
                 .unwrap();
 
             assert_eq!(r.templates.len(), 3);
-            assert_eq!(r.templates.contains_key("t1"), true);
-            assert_eq!(r.templates.contains_key("t2"), true);
-            assert_eq!(r.templates.contains_key("t3"), true);
-            assert_eq!(r.templates.contains_key("t4"), false);
+            assert!(r.templates.contains_key("t1"));
+            assert!(r.templates.contains_key("t2"));
+            assert!(r.templates.contains_key("t3"));
+            assert!(!r.templates.contains_key("t4"));
 
             drop(file1);
             drop(file2);
@@ -938,22 +987,22 @@ mod test {
             let dir = tempdir().unwrap();
 
             let file1_path = dir.path().join("t4.hbs");
-            let mut file1: File = File::create(&file1_path).unwrap();
+            let mut file1: File = File::create(file1_path).unwrap();
             writeln!(file1, "<h1>Hello {{world}}!</h1>").unwrap();
 
             let file2_path = dir.path().join("t5.erb");
-            let mut file2: File = File::create(&file2_path).unwrap();
+            let mut file2: File = File::create(file2_path).unwrap();
             writeln!(file2, "<h1>Hello {{% world %}}!</h1>").unwrap();
 
             let file3_path = dir.path().join("t6.html");
-            let mut file3: File = File::create(&file3_path).unwrap();
+            let mut file3: File = File::create(file3_path).unwrap();
             writeln!(file3, "<h1>Hello world!</h1>").unwrap();
 
             r.register_templates_directory(dir.path(), DirectorySourceOptions::default())
                 .unwrap();
 
             assert_eq!(r.templates.len(), 4);
-            assert_eq!(r.templates.contains_key("t4"), true);
+            assert!(r.templates.contains_key("t4"));
 
             drop(file1);
             drop(file2);
@@ -965,33 +1014,33 @@ mod test {
         {
             let dir = tempdir().unwrap();
 
-            let _ = DirBuilder::new().create(dir.path().join("french")).unwrap();
-            let _ = DirBuilder::new()
+            DirBuilder::new().create(dir.path().join("french")).unwrap();
+            DirBuilder::new()
                 .create(dir.path().join("portugese"))
                 .unwrap();
-            let _ = DirBuilder::new()
+            DirBuilder::new()
                 .create(dir.path().join("italian"))
                 .unwrap();
 
             let file1_path = dir.path().join("french/t7.hbs");
-            let mut file1: File = File::create(&file1_path).unwrap();
+            let mut file1: File = File::create(file1_path).unwrap();
             writeln!(file1, "<h1>Bonjour {{world}}!</h1>").unwrap();
 
             let file2_path = dir.path().join("portugese/t8.hbs");
-            let mut file2: File = File::create(&file2_path).unwrap();
+            let mut file2: File = File::create(file2_path).unwrap();
             writeln!(file2, "<h1>Ola {{world}}!</h1>").unwrap();
 
             let file3_path = dir.path().join("italian/t9.hbs");
-            let mut file3: File = File::create(&file3_path).unwrap();
+            let mut file3: File = File::create(file3_path).unwrap();
             writeln!(file3, "<h1>Ciao {{world}}!</h1>").unwrap();
 
             r.register_templates_directory(dir.path(), DirectorySourceOptions::default())
                 .unwrap();
 
             assert_eq!(r.templates.len(), 7);
-            assert_eq!(r.templates.contains_key("french/t7"), true);
-            assert_eq!(r.templates.contains_key("portugese/t8"), true);
-            assert_eq!(r.templates.contains_key("italian/t9"), true);
+            assert!(r.templates.contains_key("french/t7"));
+            assert!(r.templates.contains_key("portugese/t8"));
+            assert!(r.templates.contains_key("italian/t9"));
 
             drop(file1);
             drop(file2);
@@ -1004,21 +1053,21 @@ mod test {
             let dir = tempdir().unwrap();
 
             let file1_path = dir.path().join("t10.hbs");
-            let mut file1: File = File::create(&file1_path).unwrap();
+            let mut file1: File = File::create(file1_path).unwrap();
             writeln!(file1, "<h1>Bonjour {{world}}!</h1>").unwrap();
 
             let mut dir_path = dir
                 .path()
                 .to_string_lossy()
                 .replace(std::path::MAIN_SEPARATOR, "/");
-            if !dir_path.ends_with("/") {
+            if !dir_path.ends_with('/') {
                 dir_path.push('/');
             }
             r.register_templates_directory(dir_path, DirectorySourceOptions::default())
                 .unwrap();
 
             assert_eq!(r.templates.len(), 8);
-            assert_eq!(r.templates.contains_key("t10"), true);
+            assert!(r.templates.contains_key("t10"));
 
             drop(file1);
             dir.close().unwrap();
@@ -1029,14 +1078,14 @@ mod test {
             let mut r = Registry::new();
 
             let file1_path = dir.path().join("t11.hbs.html");
-            let mut file1: File = File::create(&file1_path).unwrap();
+            let mut file1: File = File::create(file1_path).unwrap();
             writeln!(file1, "<h1>Bonjour {{world}}!</h1>").unwrap();
 
             let mut dir_path = dir
                 .path()
                 .to_string_lossy()
                 .replace(std::path::MAIN_SEPARATOR, "/");
-            if !dir_path.ends_with("/") {
+            if !dir_path.ends_with('/') {
                 dir_path.push('/');
             }
             r.register_templates_directory(
@@ -1049,7 +1098,7 @@ mod test {
             .unwrap();
 
             assert_eq!(r.templates.len(), 1);
-            assert_eq!(r.templates.contains_key("t11"), true);
+            assert!(r.templates.contains_key("t11"));
 
             drop(file1);
             dir.close().unwrap();
@@ -1062,7 +1111,7 @@ mod test {
             assert_eq!(r.templates.len(), 0);
 
             let file1_path = dir.path().join(".t12.hbs");
-            let mut file1: File = File::create(&file1_path).unwrap();
+            let mut file1: File = File::create(file1_path).unwrap();
             writeln!(file1, "<h1>Hello {{world}}!</h1>").unwrap();
 
             r.register_templates_directory(
@@ -1075,7 +1124,7 @@ mod test {
             .unwrap();
 
             assert_eq!(r.templates.len(), 1);
-            assert_eq!(r.templates.contains_key(".t12"), true);
+            assert!(r.templates.contains_key(".t12"));
 
             drop(file1);
 
@@ -1183,7 +1232,7 @@ mod test {
                 _ => unreachable!(),
             },
             "this.[3]"
-        )
+        );
     }
 
     use crate::json::value::ScopedJson;

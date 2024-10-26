@@ -5,6 +5,7 @@ extern crate serde_derive;
 
 use criterion::Criterion;
 use handlebars::{to_json, Context, Handlebars, Template};
+use serde_json::json;
 use serde_json::value::Value as Json;
 use std::collections::BTreeMap;
 
@@ -29,9 +30,9 @@ struct CpuProfiler<'a> {
 }
 
 #[cfg(unix)]
-impl<'a> Profiler for CpuProfiler<'a> {
+impl Profiler for CpuProfiler<'_> {
     fn start_profiling(&mut self, _benchmark_id: &str, benchmark_dir: &Path) {
-        create_dir_all(&benchmark_dir).unwrap();
+        create_dir_all(benchmark_dir).unwrap();
 
         let guard = ProfilerGuard::new(100).unwrap();
         self.guard = Some(guard);
@@ -39,11 +40,11 @@ impl<'a> Profiler for CpuProfiler<'a> {
 
     fn stop_profiling(&mut self, benchmark_id: &str, benchmark_dir: &Path) {
         if let Ok(ref report) = self.guard.as_ref().unwrap().report().build() {
-            let fg_file_name = benchmark_dir.join(format!("{}.svg", benchmark_id));
+            let fg_file_name = benchmark_dir.join(format!("{benchmark_id}.svg"));
             let fg_file = File::create(fg_file_name).unwrap();
             report.flamegraph(fg_file).unwrap();
 
-            let pb_file_name = benchmark_dir.join(format!("{}.pb", benchmark_id));
+            let pb_file_name = benchmark_dir.join(format!("{benchmark_id}.pb"));
             let mut pb_file = File::create(pb_file_name).unwrap();
             let profile = report.pprof().unwrap();
 
@@ -77,7 +78,7 @@ struct NestedRowWrapper {
     parent: Vec<Vec<DataWrapper>>,
 }
 
-static SOURCE: &'static str = "<html>
+static SOURCE: &str = "<html>
   <head>
     <title>{{year}}</title>
   </head>
@@ -100,7 +101,7 @@ fn make_data() -> BTreeMap<String, Json> {
 
     let mut teams = Vec::new();
 
-    for v in vec![
+    for v in [
         ("Jiangsu", 43u16),
         ("Beijing", 27u16),
         ("Guangzhou", 22u16),
@@ -112,7 +113,7 @@ fn make_data() -> BTreeMap<String, Json> {
         let mut t = BTreeMap::new();
         t.insert("name".to_string(), to_json(name));
         t.insert("score".to_string(), to_json(score));
-        teams.push(t)
+        teams.push(t);
     }
 
     data.insert("teams".to_string(), to_json(&teams));
@@ -121,7 +122,7 @@ fn make_data() -> BTreeMap<String, Json> {
 
 fn parse_template(c: &mut Criterion) {
     c.bench_function("parse_template", move |b| {
-        b.iter(|| Template::compile(SOURCE).ok().unwrap())
+        b.iter(|| Template::compile(SOURCE).ok().unwrap());
     });
 }
 
@@ -129,12 +130,11 @@ fn render_template(c: &mut Criterion) {
     let mut handlebars = Handlebars::new();
     handlebars
         .register_template_string("table", SOURCE)
-        .ok()
         .expect("Invalid template format");
 
     let ctx = Context::wraps(make_data()).unwrap();
     c.bench_function("render_template", move |b| {
-        b.iter(|| handlebars.render_with_context("table", &ctx).ok().unwrap())
+        b.iter(|| handlebars.render_with_context("table", &ctx).ok().unwrap());
     });
 }
 
@@ -142,24 +142,23 @@ fn large_loop_helper(c: &mut Criterion) {
     let mut handlebars = Handlebars::new();
     handlebars
         .register_template_string("test", "BEFORE\n{{#each real}}{{this.v}}{{/each}}AFTER")
-        .ok()
         .expect("Invalid template format");
 
     let real: Vec<DataWrapper> = (1..1000)
         .map(|i| DataWrapper {
-            v: format!("n={}", i),
+            v: format!("n={i}"),
         })
         .collect();
     let dummy: Vec<DataWrapper> = (1..1000)
         .map(|i| DataWrapper {
-            v: format!("n={}", i),
+            v: format!("n={i}"),
         })
         .collect();
     let rows = RowWrapper { real, dummy };
 
-    let ctx = Context::wraps(&rows).unwrap();
+    let ctx = Context::wraps(rows).unwrap();
     c.bench_function("large_loop_helper", move |b| {
-        b.iter(|| handlebars.render_with_context("test", &ctx).ok().unwrap())
+        b.iter(|| handlebars.render_with_context("test", &ctx).ok().unwrap());
     });
 }
 
@@ -167,23 +166,22 @@ fn large_loop_helper_with_context_creation(c: &mut Criterion) {
     let mut handlebars = Handlebars::new();
     handlebars
         .register_template_string("test", "BEFORE\n{{#each real}}{{this.v}}{{/each}}AFTER")
-        .ok()
         .expect("Invalid template format");
 
     let real: Vec<DataWrapper> = (1..1000)
         .map(|i| DataWrapper {
-            v: format!("n={}", i),
+            v: format!("n={i}"),
         })
         .collect();
     let dummy: Vec<DataWrapper> = (1..1000)
         .map(|i| DataWrapper {
-            v: format!("n={}", i),
+            v: format!("n={i}"),
         })
         .collect();
     let rows = RowWrapper { real, dummy };
 
     c.bench_function("large_loop_helper_with_context_creation", move |b| {
-        b.iter(|| handlebars.render("test", &rows).ok().unwrap())
+        b.iter(|| handlebars.render("test", &rows).ok().unwrap());
     });
 }
 
@@ -194,14 +192,13 @@ fn large_nested_loop(c: &mut Criterion) {
             "test",
             "BEFORE\n{{#each parent as |child|}}{{#each child}}{{this.v}}{{/each}}{{/each}}AFTER",
         )
-        .ok()
         .expect("Invalid template format");
 
     let parent: Vec<Vec<DataWrapper>> = (1..100)
         .map(|_| {
             (1..10)
                 .map(|v| DataWrapper {
-                    v: format!("v={}", v),
+                    v: format!("v={v}"),
                 })
                 .collect()
         })
@@ -209,9 +206,62 @@ fn large_nested_loop(c: &mut Criterion) {
 
     let rows = NestedRowWrapper { parent };
 
-    let ctx = Context::wraps(&rows).unwrap();
+    let ctx = Context::wraps(rows).unwrap();
     c.bench_function("large_nested_loop", move |b| {
-        b.iter(|| handlebars.render_with_context("test", &ctx).ok().unwrap())
+        b.iter(|| handlebars.render_with_context("test", &ctx).ok().unwrap());
+    });
+}
+
+fn deeply_nested_partial(c: &mut Criterion) {
+    use std::iter::repeat;
+    let mut handlebars = Handlebars::new();
+
+    handlebars
+        .register_partial(
+            "nested_partial",
+            r#"{{#each baz}}
+<div class="nested">
+    {{this}}{{#if (not @last)}}++{{/if}}
+</div>
+{{/each}}"#,
+        )
+        .expect("Invalid template format");
+
+    handlebars
+        .register_partial(
+            "partial",
+            r#"
+<div class="partial">
+{{#each bar}}
+    {{>nested_partial}}
+{{/each}}
+</div>"#,
+        )
+        .expect("Invalid template format");
+
+    handlebars
+        .register_template_string(
+            "test",
+            r#"
+<div class="test">
+{{#each foo}}
+    {{>partial}}
+{{/each}}
+</div>"#,
+        )
+        .expect("Invalid template format");
+
+    let data = json!({
+        "foo": repeat(json!({
+            "bar": repeat(json!({
+                "baz": repeat("xyz").take(7).collect::<Vec<_>>()
+            })).take(7).collect::<Vec<_>>()
+        })).take(7).collect::<Vec<_>>()
+    });
+
+    let ctx = Context::wraps(data).unwrap();
+    c.bench_function("deeply_nested_partial", move |b| {
+        b.iter(|| handlebars.render_with_context("test", &ctx).ok().unwrap());
     });
 }
 
@@ -220,7 +270,7 @@ criterion_group!(
     name = benches;
     config = profiled();
     targets = parse_template, render_template, large_loop_helper, large_loop_helper_with_context_creation,
-    large_nested_loop
+    large_nested_loop, deeply_nested_partial
 );
 
 #[cfg(not(unix))]
@@ -230,7 +280,8 @@ criterion_group!(
     render_template,
     large_loop_helper,
     large_loop_helper_with_context_creation,
-    large_nested_loop
+    large_nested_loop,
+    deeply_nested_partial
 );
 
 criterion_main!(benches);

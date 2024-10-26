@@ -12,12 +12,17 @@ use crate::grammar::{HandlebarsParser, Rule};
 use crate::json::path::{parse_json_path_from_iter, Path};
 use crate::support;
 
-use self::TemplateElement::*;
+use self::TemplateElement::{
+    Comment, DecoratorBlock, DecoratorExpression, Expression, HelperBlock, HtmlExpression,
+    PartialBlock, PartialExpression, RawString,
+};
 
+#[non_exhaustive]
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub struct TemplateMapping(pub usize, pub usize);
 
 /// A handlebars template
+#[non_exhaustive]
 #[derive(PartialEq, Eq, Clone, Debug, Default)]
 pub struct Template {
     pub name: Option<String>,
@@ -28,18 +33,17 @@ pub struct Template {
 #[derive(Default)]
 pub(crate) struct TemplateOptions {
     pub(crate) prevent_indent: bool,
+    pub(crate) is_partial: bool,
     pub(crate) name: Option<String>,
 }
 
 impl TemplateOptions {
     fn name(&self) -> String {
-        self.name
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| "Unnamed".to_owned())
+        self.name.clone().unwrap_or_else(|| "Unnamed".to_owned())
     }
 }
 
+#[non_exhaustive]
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub struct Subexpression {
     // we use box here avoid resursive struct definition
@@ -62,6 +66,7 @@ impl Subexpression {
                 block_param: None,
                 block: false,
                 chain: false,
+                indent_before_write: false,
             }))),
         }
     }
@@ -100,12 +105,14 @@ impl Subexpression {
     }
 }
 
+#[non_exhaustive]
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub enum BlockParam {
     Single(Parameter),
     Pair((Parameter, Parameter)),
 }
 
+#[non_exhaustive]
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub struct ExpressionSpec {
     pub name: Parameter,
@@ -116,6 +123,7 @@ pub struct ExpressionSpec {
     pub omit_pro_ws: bool,
 }
 
+#[non_exhaustive]
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub enum Parameter {
     // for helper name only
@@ -126,6 +134,7 @@ pub enum Parameter {
     Subexpression(Subexpression),
 }
 
+#[non_exhaustive]
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub struct HelperTemplate {
     pub name: Parameter,
@@ -136,10 +145,11 @@ pub struct HelperTemplate {
     pub inverse: Option<Template>,
     pub block: bool,
     pub chain: bool,
+    pub(crate) indent_before_write: bool,
 }
 
 impl HelperTemplate {
-    pub fn new(exp: ExpressionSpec, block: bool) -> HelperTemplate {
+    pub fn new(exp: ExpressionSpec, block: bool, indent_before_write: bool) -> HelperTemplate {
         HelperTemplate {
             name: exp.name,
             params: exp.params,
@@ -149,10 +159,15 @@ impl HelperTemplate {
             template: None,
             inverse: None,
             chain: false,
+            indent_before_write,
         }
     }
 
-    pub fn new_chain(exp: ExpressionSpec, block: bool) -> HelperTemplate {
+    pub fn new_chain(
+        exp: ExpressionSpec,
+        block: bool,
+        indent_before_write: bool,
+    ) -> HelperTemplate {
         HelperTemplate {
             name: exp.name,
             params: exp.params,
@@ -162,6 +177,7 @@ impl HelperTemplate {
             template: None,
             inverse: None,
             chain: true,
+            indent_before_write,
         }
     }
 
@@ -176,6 +192,7 @@ impl HelperTemplate {
             inverse: None,
             block: false,
             chain: false,
+            indent_before_write: false,
         }
     }
 
@@ -259,6 +276,7 @@ impl HelperTemplate {
     }
 }
 
+#[non_exhaustive]
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub struct DecoratorTemplate {
     pub name: Parameter,
@@ -267,16 +285,18 @@ pub struct DecoratorTemplate {
     pub template: Option<Template>,
     // for partial indent
     pub indent: Option<String>,
+    pub(crate) indent_before_write: bool,
 }
 
 impl DecoratorTemplate {
-    pub fn new(exp: ExpressionSpec) -> DecoratorTemplate {
+    pub fn new(exp: ExpressionSpec, indent_before_write: bool) -> DecoratorTemplate {
         DecoratorTemplate {
             name: exp.name,
             params: exp.params,
             hash: exp.hash,
             template: None,
             indent: None,
+            indent_before_write,
         }
     }
 }
@@ -551,9 +571,15 @@ impl Template {
         source: &str,
         current_span: &Span<'_>,
         prevent_indent: bool,
+        is_partial: bool,
     ) -> bool {
-        let with_trailing_newline =
-            support::str::starts_with_empty_line(&source[current_span.end()..]);
+        let continuation = &source[current_span.end()..];
+
+        let mut with_trailing_newline = support::str::starts_with_empty_line(continuation);
+
+        // For full templates, we behave as if there was a trailing newline if we encounter
+        // the end of input. See #611.
+        with_trailing_newline |= !is_partial && continuation.is_empty();
 
         if with_trailing_newline {
             let with_leading_newline =
@@ -660,7 +686,7 @@ impl Template {
         let mut end_pos: Option<Position<'_>> = None;
         loop {
             if let Some(pair) = it.next() {
-                let prev_end = end_pos.as_ref().map(|p| p.pos()).unwrap_or(0);
+                let prev_end = end_pos.as_ref().map_or(0, pest::Position::pos);
                 let rule = pair.as_rule();
                 let span = pair.as_span();
 
@@ -718,6 +744,7 @@ impl Template {
                         };
 
                         let t = template_stack.front_mut().unwrap();
+
                         t.push_element(
                             Template::raw_string(
                                 &source[start..span.end()],
@@ -738,18 +765,6 @@ impl Template {
                     | Rule::partial_block_start => {
                         let exp = Template::parse_expression(source, it.by_ref(), span.end())?;
 
-                        match rule {
-                            Rule::helper_block_start | Rule::raw_block_start => {
-                                let helper_template = HelperTemplate::new(exp.clone(), true);
-                                helper_stack.push_front(helper_template);
-                            }
-                            Rule::decorator_block_start | Rule::partial_block_start => {
-                                let decorator = DecoratorTemplate::new(exp.clone());
-                                decorator_stack.push_front(decorator);
-                            }
-                            _ => unreachable!(),
-                        }
-
                         if exp.omit_pre_ws {
                             Template::remove_previous_whitespace(&mut template_stack);
                         }
@@ -762,7 +777,24 @@ impl Template {
                             source,
                             &span,
                             true,
+                            options.is_partial,
                         );
+
+                        let indent_before_write = trim_line_required && !exp.omit_pre_ws;
+
+                        match rule {
+                            Rule::helper_block_start | Rule::raw_block_start => {
+                                let helper_template =
+                                    HelperTemplate::new(exp.clone(), true, indent_before_write);
+                                helper_stack.push_front(helper_template);
+                            }
+                            Rule::decorator_block_start | Rule::partial_block_start => {
+                                let decorator =
+                                    DecoratorTemplate::new(exp.clone(), indent_before_write);
+                                decorator_stack.push_front(decorator);
+                            }
+                            _ => unreachable!(),
+                        }
 
                         let t = template_stack.front_mut().unwrap();
                         t.mapping.push(TemplateMapping(line_no, col_no));
@@ -788,7 +820,10 @@ impl Template {
                             source,
                             &span,
                             true,
+                            options.is_partial,
                         );
+
+                        let indent_before_write = trim_line_required && !exp.omit_pre_ws;
 
                         let t = template_stack.pop_front().unwrap();
                         let h = helper_stack.front_mut().unwrap();
@@ -799,7 +834,11 @@ impl Template {
 
                         h.set_chain_template(Some(t));
                         if rule == Rule::invert_chain_tag {
-                            h.insert_inverse_node(Box::new(HelperTemplate::new_chain(exp, true)));
+                            h.insert_inverse_node(Box::new(HelperTemplate::new_chain(
+                                exp,
+                                true,
+                                indent_before_write,
+                            )));
                         }
                     }
 
@@ -834,7 +873,8 @@ impl Template {
 
                         match rule {
                             Rule::expression | Rule::html_expression => {
-                                let helper_template = HelperTemplate::new(exp.clone(), false);
+                                let helper_template =
+                                    HelperTemplate::new(exp.clone(), false, false);
                                 let el = if rule == Rule::expression {
                                     Expression(Box::new(helper_template))
                                 } else {
@@ -846,12 +886,14 @@ impl Template {
                             Rule::decorator_expression | Rule::partial_expression => {
                                 // do not auto trim ident spaces for
                                 // partial_expression(>)
-                                let prevent_indent = rule != Rule::partial_expression;
+                                let prevent_indent =
+                                    !(rule == Rule::partial_expression && options.prevent_indent);
                                 trim_line_required = Template::process_standalone_statement(
                                     &mut template_stack,
                                     source,
                                     &span,
                                     prevent_indent,
+                                    options.is_partial,
                                 );
 
                                 // indent for partial expression >
@@ -865,8 +907,11 @@ impl Template {
                                     );
                                 }
 
-                                let mut decorator = DecoratorTemplate::new(exp.clone());
-                                decorator.indent = indent.map(|s| s.to_owned());
+                                let mut decorator = DecoratorTemplate::new(
+                                    exp.clone(),
+                                    trim_line_required && !exp.omit_pre_ws,
+                                );
+                                decorator.indent = indent.map(std::borrow::ToOwned::to_owned);
 
                                 let el = if rule == Rule::decorator_expression {
                                     DecoratorExpression(Box::new(decorator))
@@ -884,6 +929,7 @@ impl Template {
                                     source,
                                     &span,
                                     true,
+                                    options.is_partial,
                                 );
 
                                 let mut h = helper_stack.pop_front().unwrap();
@@ -913,6 +959,7 @@ impl Template {
                                     source,
                                     &span,
                                     true,
+                                    options.is_partial,
                                 );
 
                                 let mut d = decorator_stack.pop_front().unwrap();
@@ -946,6 +993,7 @@ impl Template {
                             source,
                             &span,
                             true,
+                            options.is_partial,
                         );
 
                         let text = span
@@ -961,6 +1009,7 @@ impl Template {
                             source,
                             &span,
                             true,
+                            options.is_partial,
                         );
 
                         let text = span
@@ -977,7 +1026,7 @@ impl Template {
                     end_pos = Some(span.end_pos());
                 }
             } else {
-                let prev_end = end_pos.as_ref().map(|e| e.pos()).unwrap_or(0);
+                let prev_end = end_pos.as_ref().map_or(0, pest::Position::pos);
                 if prev_end < source.len() {
                     let text = &source[prev_end..source.len()];
                     // is some called in if check
@@ -1014,6 +1063,7 @@ impl Template {
     }
 }
 
+#[non_exhaustive]
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub enum TemplateElement {
     RawString(String),
@@ -1038,7 +1088,7 @@ mod test {
         let t = Template::compile(source).ok().unwrap();
         assert_eq!(t.elements.len(), 1);
         assert_eq!(
-            *t.elements.get(0).unwrap(),
+            *t.elements.first().unwrap(),
             RawString("foo {{bar}}".to_string())
         );
     }
@@ -1048,7 +1098,7 @@ mod test {
         let source = r"\\\\";
         let t = Template::compile(source).ok().unwrap();
         assert_eq!(t.elements.len(), 1);
-        assert_eq!(*t.elements.get(0).unwrap(), RawString(source.to_string()));
+        assert_eq!(*t.elements.first().unwrap(), RawString(source.to_string()));
     }
 
     #[test]
@@ -1057,7 +1107,7 @@ mod test {
         let t = Template::compile(source).ok().unwrap();
         assert_eq!(t.elements.len(), 1);
         assert_eq!(
-            *t.elements.get(0).unwrap(),
+            *t.elements.first().unwrap(),
             RawString("{{{{foo}}}} bar".to_string())
         );
     }
@@ -1071,7 +1121,7 @@ mod test {
 
         assert_eq!(t.elements.len(), 10);
 
-        assert_eq!(*t.elements.get(0).unwrap(), RawString("<h1>".to_string()));
+        assert_eq!(*t.elements.first().unwrap(), RawString("<h1>".to_string()));
         assert_eq!(
             *t.elements.get(1).unwrap(),
             Expression(Box::new(HelperTemplate::with_path(Path::with_named_paths(
@@ -1102,9 +1152,9 @@ mod test {
                 assert_eq!(h.name.as_name().unwrap(), "foo".to_string());
                 assert_eq!(h.params.len(), 1);
                 assert_eq!(
-                    *(h.params.get(0).unwrap()),
+                    *(h.params.first().unwrap()),
                     Parameter::Path(Path::with_named_paths(&["bar"]))
-                )
+                );
             }
             _ => {
                 panic!("Helper expression here");
@@ -1149,11 +1199,11 @@ mod test {
         let t = Template::compile(source).ok().unwrap();
 
         assert_eq!(t.elements.len(), 4);
-        match *t.elements.get(0).unwrap() {
+        match *t.elements.first().unwrap() {
             Expression(ref h) => {
                 assert_eq!(h.name.as_name().unwrap(), "foo".to_owned());
                 assert_eq!(h.params.len(), 1);
-                if let &Parameter::Subexpression(ref t) = h.params.get(0).unwrap() {
+                if let Parameter::Subexpression(t) = h.params.first().unwrap() {
                     assert_eq!(t.name(), "bar".to_owned());
                 } else {
                     panic!("Subexpression expected");
@@ -1168,9 +1218,9 @@ mod test {
             Expression(ref h) => {
                 assert_eq!(h.name.as_name().unwrap(), "foo".to_string());
                 assert_eq!(h.params.len(), 1);
-                if let &Parameter::Subexpression(ref t) = h.params.get(0).unwrap() {
+                if let Parameter::Subexpression(t) = h.params.first().unwrap() {
                     assert_eq!(t.name(), "bar".to_owned());
-                    if let Some(Parameter::Path(p)) = t.params().unwrap().get(0) {
+                    if let Some(Parameter::Path(p)) = t.params().unwrap().first() {
                         assert_eq!(p, &Path::with_named_paths(&["baz"]));
                     } else {
                         panic!("non-empty param expected ");
@@ -1190,9 +1240,9 @@ mod test {
                 assert_eq!(h.params.len(), 1);
                 assert_eq!(h.hash.len(), 1);
 
-                if let &Parameter::Subexpression(ref t) = h.params.get(0).unwrap() {
+                if let Parameter::Subexpression(t) = h.params.first().unwrap() {
                     assert_eq!(t.name(), "baz".to_owned());
-                    if let Some(Parameter::Path(p)) = t.params().unwrap().get(0) {
+                    if let Some(Parameter::Path(p)) = t.params().unwrap().first() {
                         assert_eq!(p, &Path::with_named_paths(&["bar"]));
                     } else {
                         panic!("non-empty param expected ");
@@ -1201,7 +1251,7 @@ mod test {
                     panic!("Subexpression expected (baz bar)");
                 }
 
-                if let &Parameter::Subexpression(ref t) = h.hash.get("then").unwrap() {
+                if let Parameter::Subexpression(t) = h.hash.get("then").unwrap() {
                     assert_eq!(t.name(), "bar".to_owned());
                 } else {
                     panic!("Subexpression expected (bar)");
@@ -1251,7 +1301,7 @@ mod test {
     #[test]
     fn test_unclosed_expression() {
         let sources = ["{{invalid", "{{{invalid", "{{invalid}", "{{!hello"];
-        for s in sources.iter() {
+        for s in &sources {
             let result = Template::compile(s.to_owned());
             let err = result.expect_err("expected a syntax error");
             let syntax_error_msg = match err.reason() {
@@ -1280,7 +1330,7 @@ mod test {
                         if let Some(ref ht) = h.template {
                             assert_eq!(ht.elements.len(), 1);
                             assert_eq!(
-                                *ht.elements.get(0).unwrap(),
+                                *ht.elements.first().unwrap(),
                                 RawString("good{{night}}".to_owned())
                             );
                         } else {
@@ -1443,6 +1493,6 @@ mod test {
         let s = "{{#>(X)}}{{/X}}";
         let result = Template::compile(s);
         assert!(result.is_err());
-        assert_eq!("decorator \"Subexpression(Subexpression { element: Expression(HelperTemplate { name: Path(Relative(([Named(\\\"X\\\")], \\\"X\\\"))), params: [], hash: {}, block_param: None, template: None, inverse: None, block: false, chain: false }) })\" was opened, but \"X\" is closing", format!("{}", result.unwrap_err().reason()));
+        assert_eq!("decorator \"Subexpression(Subexpression { element: Expression(HelperTemplate { name: Path(Relative(([Named(\\\"X\\\")], \\\"X\\\"))), params: [], hash: {}, block_param: None, template: None, inverse: None, block: false, chain: false, indent_before_write: false }) })\" was opened, but \"X\" is closing", format!("{}", result.unwrap_err().reason()));
     }
 }

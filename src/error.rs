@@ -1,3 +1,4 @@
+use std::borrow::ToOwned;
 use std::error::Error as StdError;
 use std::fmt::{self, Write};
 use std::io::Error as IOError;
@@ -13,6 +14,7 @@ use walkdir::Error as WalkdirError;
 use rhai::{EvalAltResult, ParseError};
 
 /// Error when rendering data on template.
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct RenderError {
     pub template_name: Option<String>,
@@ -36,7 +38,7 @@ impl fmt::Display for RenderError {
                 col,
                 desc
             ),
-            _ => write!(f, "{}", desc),
+            _ => write!(f, "{desc}"),
         }
     }
 }
@@ -60,6 +62,7 @@ impl From<TemplateError> for RenderError {
 }
 
 /// Template rendering error
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum RenderErrorReason {
     #[error("Template not found {0}")]
@@ -150,6 +153,12 @@ impl From<RenderErrorReason> for RenderError {
     }
 }
 
+impl From<RenderError> for RenderErrorReason {
+    fn from(e: RenderError) -> Self {
+        *e.reason
+    }
+}
+
 impl RenderError {
     #[deprecated(since = "5.0.0", note = "Use RenderErrorReason instead")]
     pub fn new<T: AsRef<str>>(desc: T) -> RenderError {
@@ -157,7 +166,7 @@ impl RenderError {
     }
 
     pub fn strict_error(path: Option<&String>) -> RenderError {
-        RenderErrorReason::MissingVariable(path.map(|p| p.to_owned())).into()
+        RenderErrorReason::MissingVariable(path.map(ToOwned::to_owned)).into()
     }
 
     #[deprecated(since = "5.0.0", note = "Use RenderErrorReason::NestedError instead")]
@@ -186,6 +195,7 @@ impl StdError for RenderError {
 }
 
 /// Template parsing error
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum TemplateErrorReason {
     #[error("helper {0:?} was opened, but {1:?} is closing")]
@@ -278,7 +288,7 @@ impl From<WalkdirError> for TemplateError {
 
 fn template_segment(template_str: &str, line: usize, col: usize) -> String {
     let range = 3;
-    let line_start = if line >= range { line - range } else { 0 };
+    let line_start = line.saturating_sub(range);
     let line_end = line + range;
 
     let mut buf = String::new();
@@ -323,6 +333,7 @@ impl fmt::Display for TemplateError {
 }
 
 #[cfg(feature = "script_helper")]
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum ScriptError {
     #[error(transparent)]

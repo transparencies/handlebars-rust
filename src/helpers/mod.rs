@@ -3,7 +3,7 @@ use crate::error::{RenderError, RenderErrorReason};
 use crate::json::value::ScopedJson;
 use crate::output::Output;
 use crate::registry::Registry;
-use crate::render::{do_escape, Helper, RenderContext};
+use crate::render::{do_escape, indent_aware_write, Helper, RenderContext};
 
 pub use self::helper_each::EACH_HELPER;
 pub use self::helper_if::{IF_HELPER, UNLESS_HELPER};
@@ -25,7 +25,8 @@ pub type HelperResult = Result<(), RenderError>;
 /// * `&mut RenderContext`: you can access data or modify variables (starts with @)/partials in render context, for example, @index of #each. See its document for detail.
 /// * `&mut dyn Output`: where you write output to
 ///
-/// By default, you can use a bare function as a helper definition because we have supported unboxed_closure. If you have stateful or configurable helper, you can create a struct to implement `HelperDef`.
+/// By default, you can use a bare function as a helper definition because we have supported `unboxed_closure`.
+/// If you have stateful or configurable helper, you can create a struct to implement `HelperDef`.
 ///
 /// ## Define an inline helper
 ///
@@ -126,7 +127,9 @@ pub trait HelperDef {
                 } else {
                     // auto escape according to settings
                     let output = do_escape(r, rc, result.render());
-                    out.write(output.as_ref())?;
+
+                    indent_aware_write(&output, rc, out)?;
+
                     Ok(())
                 }
             }
@@ -142,7 +145,7 @@ pub trait HelperDef {
     }
 }
 
-/// implement HelperDef for bare function so we can use function as helper
+/// implement `HelperDef` for bare function so we can use function as helper
 impl<
         F: for<'reg, 'rc> Fn(
             &Helper<'rc>,
@@ -179,12 +182,6 @@ pub(crate) mod scripting;
 #[cfg(feature = "string_helpers")]
 pub(crate) mod string_helpers;
 
-// pub type HelperDef = for <'a, 'b, 'c> Fn<(&'a Context, &'b Helper, &'b Registry, &'c mut RenderContext), Result<String, RenderError>>;
-//
-// pub fn helper_dummy (ctx: &Context, h: &Helper, r: &Registry, rc: &mut RenderContext) -> Result<String, RenderError> {
-// h.template().unwrap().render(ctx, r, rc).unwrap()
-// }
-//
 #[cfg(test)]
 mod test {
     use std::collections::BTreeMap;

@@ -8,6 +8,7 @@ use crate::grammar::{HandlebarsParser, Rule};
 use crate::RenderErrorReason;
 
 #[derive(PartialEq, Eq, Clone, Debug)]
+#[non_exhaustive]
 pub enum PathSeg {
     Named(String),
     Ruled(Rule),
@@ -50,7 +51,7 @@ impl Path {
     }
 
     pub(crate) fn current() -> Path {
-        Path::Relative((Vec::with_capacity(0), "".to_owned()))
+        Path::Relative((Vec::with_capacity(0), String::new()))
     }
 
     // for test only

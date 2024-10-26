@@ -50,7 +50,7 @@ impl<'rc> ScopedJson<'rc> {
     }
 }
 
-impl<'reg: 'rc, 'rc> From<Json> for ScopedJson<'rc> {
+impl<'rc> From<Json> for ScopedJson<'rc> {
     fn from(v: Json) -> ScopedJson<'rc> {
         ScopedJson::Derived(v)
     }
@@ -88,6 +88,14 @@ impl<'rc> PathAndJson<'rc> {
         self.value.as_json()
     }
 
+    /// Returns the value, if it is a constant. Otherwise returns None.
+    pub fn try_get_constant_value(&self) -> Option<&'rc Json> {
+        match &self.value {
+            ScopedJson::Constant(value) => Some(*value),
+            ScopedJson::Context(_, _) | ScopedJson::Derived(_) | ScopedJson::Missing => None,
+        }
+    }
+
     /// Test if value is missing
     pub fn is_value_missing(&self) -> bool {
         self.value.is_missing()
@@ -113,7 +121,7 @@ impl JsonRender for Json {
             Json::String(ref s) => s.to_string(),
             Json::Bool(i) => i.to_string(),
             Json::Number(ref n) => n.to_string(),
-            Json::Null => "".to_owned(),
+            Json::Null => String::new(),
             Json::Array(ref a) => {
                 let mut buf = String::new();
                 buf.push('[');
@@ -150,10 +158,10 @@ impl JsonTruthy for Json {
             Json::Bool(ref i) => *i,
             Json::Number(ref n) => {
                 if include_zero {
-                    n.as_f64().map(|f| !f.is_nan()).unwrap_or(false)
+                    n.as_f64().is_some_and(|f| !f.is_nan())
                 } else {
                     // there is no inifity in json/serde_json
-                    n.as_f64().map(|f| f.is_normal()).unwrap_or(false)
+                    n.as_f64().is_some_and(f64::is_normal)
                 }
             }
             Json::Null => false,

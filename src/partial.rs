@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 
 use serde_json::value::Value as Json;
@@ -15,22 +14,26 @@ use crate::RenderErrorReason;
 
 pub(crate) const PARTIAL_BLOCK: &str = "@partial-block";
 
-fn find_partial<'reg: 'rc, 'rc: 'a, 'a>(
-    rc: &'a RenderContext<'reg, 'rc>,
+fn find_partial<'reg: 'rc, 'rc>(
+    rc: &RenderContext<'reg, 'rc>,
     r: &'reg Registry<'reg>,
     d: &Decorator<'rc>,
     name: &str,
-) -> Result<Option<Cow<'a, Template>>, RenderError> {
+) -> Result<Option<&'rc Template>, RenderError> {
     if let Some(partial) = rc.get_partial(name) {
-        return Ok(Some(Cow::Borrowed(partial)));
+        return Ok(Some(partial));
     }
 
-    if let Some(tpl) = r.get_or_load_template_optional(name) {
-        return tpl.map(Option::Some);
+    if let Some(t) = rc.get_dev_mode_template(name) {
+        return Ok(Some(t));
+    }
+
+    if let Some(t) = r.get_template(name) {
+        return Ok(Some(t));
     }
 
     if let Some(tpl) = d.template() {
-        return Ok(Some(Cow::Borrowed(tpl)));
+        return Ok(Some(tpl));
     }
 
     Ok(None)
@@ -49,107 +52,103 @@ pub fn expand_partial<'reg: 'rc, 'rc>(
     }
 
     let tname = d.name();
+
+    let current_template_before = rc.get_current_template_name();
+    let indent_before = rc.get_indent_string().cloned();
+
     if rc.is_current_template(tname) {
         return Err(RenderErrorReason::CannotIncludeSelf.into());
     }
 
     let partial = find_partial(rc, r, d, tname)?;
 
-    if let Some(t) = partial {
-        // clone to avoid lifetime issue
-        // FIXME refactor this to avoid
-        let mut local_rc = rc.clone();
+    let Some(partial) = partial else {
+        return Err(RenderErrorReason::PartialNotFound(tname.to_owned()).into());
+    };
 
-        // if tname == PARTIAL_BLOCK
-        let is_partial_block = tname == PARTIAL_BLOCK;
+    let is_partial_block = tname == PARTIAL_BLOCK;
 
-        // add partial block depth there are consecutive partial
-        // blocks in the stack.
-        if is_partial_block {
-            local_rc.inc_partial_block_depth();
-        } else {
-            // depth cannot be lower than 0, which is guaranted in the
-            // `dec_partial_block_depth` method
-            local_rc.dec_partial_block_depth();
-        }
-
-        let mut block_created = false;
-
-        // create context if param given
-        if let Some(base_path) = d.param(0).and_then(|p| p.context_path()) {
-            // path given, update base_path
-            let mut block_inner = BlockContext::new();
-            *block_inner.base_path_mut() = base_path.to_vec();
-
-            // because block is moved here, we need another bool variable to track
-            // its status for later cleanup
-            block_created = true;
-            // clear blocks to prevent block params from parent
-            // template to be leaked into partials
-            // see `test_partial_context_issue_495` for the case.
-            local_rc.clear_blocks();
-            local_rc.push_block(block_inner);
-        }
-
-        if !d.hash().is_empty() {
-            // hash given, update base_value
-            let hash_ctx = d
-                .hash()
-                .iter()
-                .map(|(k, v)| (*k, v.value()))
-                .collect::<HashMap<&str, &Json>>();
-
-            // create block if we didn't (no param provided for partial expression)
-            if !block_created {
-                let block_inner = if let Some(block) = local_rc.block() {
-                    // reuse current block information, including base_path and
-                    // base_value if any
-                    block.clone()
-                } else {
-                    BlockContext::new()
-                };
-
-                local_rc.clear_blocks();
-                local_rc.push_block(block_inner);
-            }
-
-            // evaluate context within current block, this includes block
-            // context provided by partial expression parameter
-            let merged_context = merge_json(
-                local_rc.evaluate2(ctx, &Path::current())?.as_json(),
-                &hash_ctx,
-            );
-
-            // update the base value, there must be a block for this so it's
-            // also safe to unwrap.
-            if let Some(block) = local_rc.block_mut() {
-                block.set_base_value(merged_context);
-            }
-        }
-
-        // @partial-block
-        if let Some(pb) = d.template() {
-            local_rc.push_partial_block(pb);
-        }
-
-        // indent
-        local_rc.set_indent_string(d.indent());
-
-        let result = t.render(r, ctx, &mut local_rc, out);
-
-        // cleanup
-        if block_created {
-            local_rc.pop_block();
-        }
-
-        if d.template().is_some() {
-            local_rc.pop_partial_block();
-        }
-
-        result
+    // add partial block depth there are consecutive partial
+    // blocks in the stack.
+    if is_partial_block {
+        rc.inc_partial_block_depth();
     } else {
-        Err(RenderErrorReason::PartialNotFound(tname.to_owned()).into())
+        // depth cannot be lower than 0, which is guaranted in the
+        // `dec_partial_block_depth` method
+        rc.dec_partial_block_depth();
     }
+
+    let mut block_created = false;
+
+    // create context if param given
+    if let Some(base_path) = d.param(0).and_then(|p| p.context_path()) {
+        // path given, update base_path
+        let mut block_inner = BlockContext::new();
+        *block_inner.base_path_mut() = base_path.to_vec();
+
+        block_created = true;
+        rc.push_block(block_inner);
+    }
+
+    if !d.hash().is_empty() {
+        // hash given, update base_value
+        let hash_ctx = d
+            .hash()
+            .iter()
+            .map(|(k, v)| (*k, v.value()))
+            .collect::<HashMap<&str, &Json>>();
+
+        // create block if we didn't (no param provided for partial expression)
+        if !block_created {
+            let block_inner = if let Some(block) = rc.block() {
+                // reuse current block information, including base_path and
+                // base_value if any
+                block.clone()
+            } else {
+                BlockContext::new()
+            };
+
+            block_created = true;
+            rc.push_block(block_inner);
+        }
+
+        // evaluate context within current block, this includes block
+        // context provided by partial expression parameter
+        let merged_context = merge_json(rc.evaluate2(ctx, &Path::current())?.as_json(), &hash_ctx);
+
+        // update the base value, there must be a block for this so it's
+        // also safe to unwrap.
+        if let Some(block) = rc.block_mut() {
+            block.set_base_value(merged_context);
+        }
+    }
+
+    // @partial-block
+    if let Some(pb) = d.template() {
+        rc.push_partial_block(pb);
+    }
+
+    // indent
+    rc.set_indent_string(d.indent().cloned());
+
+    let result = partial.render(r, ctx, rc, out);
+
+    // cleanup
+    let trailing_newline = rc.get_trailine_newline();
+
+    if d.template().is_some() {
+        rc.pop_partial_block();
+    }
+
+    if block_created {
+        rc.pop_block();
+    }
+
+    rc.set_trailing_newline(trailing_newline);
+    rc.set_current_template_name(current_template_before);
+    rc.set_indent_string(indent_before);
+
+    result
 }
 
 #[cfg(test)]
@@ -349,13 +348,13 @@ mod test {
         let template3 = "{{#> t2 }}Hello{{/ t2 }}";
 
         handlebars
-            .register_template_string("t1", &template1)
+            .register_template_string("t1", template1)
             .unwrap();
         handlebars
-            .register_template_string("t2", &template2)
+            .register_template_string("t2", template2)
             .unwrap();
 
-        let page = handlebars.render_template(&template3, &json!({})).unwrap();
+        let page = handlebars.render_template(template3, &json!({})).unwrap();
         assert_eq!("<outer><inner>Hello</inner></outer>", page);
     }
 
@@ -390,22 +389,22 @@ mod test {
 
         let hbs = Registry::new();
         assert_eq!(
-            r#"foo
+            r"foo
 foo
 foo
-"#,
+",
             hbs.render_template(tpl0, &json!({})).unwrap()
         );
         assert_eq!(
-            r#"
-foofoofoo"#,
+            r"
+foofoofoo",
             hbs.render_template(tpl1, &json!({})).unwrap()
         );
     }
 
     #[test]
     fn test_partial_indent() {
-        let outer = r#"                {{> inner inner_solo}}
+        let outer = r"                {{> inner inner_solo}}
 
 {{#each inners}}
                 {{> inner}}
@@ -414,9 +413,9 @@ foofoofoo"#,
         {{#each inners}}
         {{> inner}}
         {{/each}}
-"#;
-        let inner = r#"name: {{name}}
-"#;
+";
+        let inner = r"name: {{name}}
+";
 
         let mut hbs = Registry::new();
 
@@ -438,21 +437,21 @@ foofoofoo"#,
 
         assert_eq!(
             result,
-            r#"                name: inner_solo
+            r"                name: inner_solo
 
                 name: hello
                 name: there
 
         name: hello
         name: there
-"#
+"
         );
     }
     // Rule::partial_expression should not trim leading indent  by default
 
     #[test]
     fn test_partial_prevent_indent() {
-        let outer = r#"                {{> inner inner_solo}}
+        let outer = r"                {{> inner inner_solo}}
 
 {{#each inners}}
                 {{> inner}}
@@ -461,9 +460,9 @@ foofoofoo"#,
         {{#each inners}}
         {{> inner}}
         {{/each}}
-"#;
-        let inner = r#"name: {{name}}
-"#;
+";
+        let inner = r"name: {{name}}
+";
 
         let mut hbs = Registry::new();
         hbs.set_prevent_indent(true);
@@ -486,14 +485,14 @@ foofoofoo"#,
 
         assert_eq!(
             result,
-            r#"                name: inner_solo
+            r"                name: inner_solo
 
                 name: hello
                 name: there
 
         name: hello
         name: there
-"#
+"
         );
     }
 
@@ -504,18 +503,18 @@ foofoofoo"#,
             .unwrap();
         hb.register_template_string(
             "index",
-            r#"{{#>partial}}
+            r"{{#>partial}}
     Yo
     {{#>partial}}
     Yo 2
     {{/partial}}
-{{/partial}}"#,
+{{/partial}}",
         )
         .unwrap();
         assert_eq!(
-            r#"    Yo
+            r"    Yo
     Yo 2
-"#,
+",
             hb.render("index", &()).unwrap()
         );
 
@@ -523,11 +522,11 @@ foofoofoo"#,
             .unwrap();
         let r2 = hb
             .render_template(
-                r#"{{#> partial}}
+                r"{{#> partial}}
 {{#> partial2}}
 :(
 {{/partial2}}
-{{/partial}}"#,
+{{/partial}}",
                 &(),
             )
             .unwrap();
@@ -566,11 +565,11 @@ Name:{{name}}
         });
 
         assert_eq!(
-            r#"Name:hudel
+            r"Name:hudel
 Template:hudel
 Name:test
 Template:test
-"#,
+",
             hb.render("t1", &data).unwrap()
         );
     }
@@ -590,9 +589,9 @@ outer third line"#,
         )
         .unwrap();
         assert_eq!(
-            r#"    inner first line
+            r"    inner first line
     inner second line
-outer third line"#,
+outer third line",
             hb.render("t1", &()).unwrap()
         );
 
@@ -606,9 +605,9 @@ outer third line"#,
         )
         .unwrap();
         assert_eq!(
-            r#"  inner first line
+            r"  inner first line
   inner second line
-outer third line"#,
+outer third line",
             hb.render("t2", &()).unwrap()
         );
 
@@ -620,9 +619,9 @@ outer third line"#,
         )
         .unwrap();
         assert_eq!(
-            r#"
+            r"
   inner first line
-  inner second lineouter third line"#,
+  inner second lineouter third line",
             hb.render("t3", &json!({"a": "inner first line\ninner second line"}))
                 .unwrap()
         );
@@ -638,9 +637,9 @@ outer third line"#,
         )
         .unwrap();
         assert_eq!(
-            r#"  inner first line
+            r"  inner first line
   inner second line
-outer third line"#,
+outer third line",
             hb.render("t4", &()).unwrap()
         );
 
@@ -658,11 +657,53 @@ outer third line"#,
         )
         .unwrap();
         assert_eq!(
-            r#"    inner first line
+            r"    inner first line
   inner second line
-outer third line"#,
+outer third line",
             hb2.render("t1", &()).unwrap()
-        )
+        );
+    }
+
+    #[test]
+    fn test_indent_level_on_nested_partials() {
+        let nested_partial = "
+<div>
+    content
+</div>
+";
+        let partial = "
+<div>
+    {{>nested_partial}}
+</div>
+";
+
+        let partial_indented = "
+<div>
+    {{>partial}}
+</div>
+";
+
+        let result = "
+<div>
+    <div>
+        <div>
+            content
+        </div>
+    </div>
+</div>
+";
+
+        let mut hb = Registry::new();
+        hb.register_template_string("nested_partial", nested_partial.trim_start())
+            .unwrap();
+        hb.register_template_string("partial", partial.trim_start())
+            .unwrap();
+        hb.register_template_string("partial_indented", partial_indented.trim_start())
+            .unwrap();
+
+        let s = hb.render("partial_indented", &()).unwrap();
+
+        assert_eq!(&s, result.trim_start());
     }
 
     #[test]
@@ -688,6 +729,6 @@ outer third line"#,
     fn test_partial_not_found() {
         let t1 = "{{> bar}}";
         let hbs = Registry::new();
-        assert!(hbs.render_template(&t1, &()).is_err());
+        assert!(hbs.render_template(t1, &()).is_err());
     }
 }
