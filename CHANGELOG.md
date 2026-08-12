@@ -1,5 +1,11 @@
 # Change Log
 
+## [Unreleased] - ReleaseDate
+
+* [Changed] We have to revert `preserve_json_order` as a default feature. Users
+  who need this can still enable it for handlebars-rust, or enable
+  `preserve_order` for you serde_json.
+
 ## [6.4.3] - 2026-07-12
 
 * [Fixed] Panic when using whitespace omission (`~`) on an `else if`
