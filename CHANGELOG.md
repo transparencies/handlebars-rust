@@ -1,6 +1,6 @@
 # Change Log
 
-## [Unreleased] - ReleaseDate
+## [6.4.4] - 2026-08-12
 
 * [Changed] We have to revert `preserve_json_order` as a default feature. Users
   who need this can still enable it for handlebars-rust, or enable
